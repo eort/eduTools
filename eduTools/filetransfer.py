@@ -3,8 +3,6 @@ import os
 import glob
 import json
 import sys
-import pandas as pd
-
 
 def local2mountedRemote(local_dir, remote_dir, overwrite=False, options=''):
     """
@@ -27,7 +25,7 @@ def local2mountedRemote(local_dir, remote_dir, overwrite=False, options=''):
                                        shell=True)
 
 
-def local2Remote(local_dir, remote_dir, user,
+def ssh_send(local_dir, remote_dir, user,
                  remote_address='storage.hpc.rz.uni-duesseldorf.de',
                  overwrite=False, options=''):
     """
