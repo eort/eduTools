@@ -6,6 +6,7 @@ import sys
 from IPython import embed as shell
 import glob
 import pandas as pd
+import logging
 
 def read_json(fname):
     """Save reading of json files
@@ -64,20 +65,23 @@ def save_plot(fig, outpath, **kwargs):
 
 
 def concatenate_text_files(search_dir, search_pattern, sep='\t'):
+    """Combines all files that match the pattern in a single dataframe
+
+    Parameters
+    ----------
+    search_dir : Path-like | String
+        directory where the to-be-concatenated files will be search for
+    search_pattern : String
+        Glob pattern that will be used to detect files
+    sep : String
+        what delimiting values are used in the files to be concatenated
     """
-    Loading Bids formatted behavioural data into a single data frame
-    Also adds a deblinding file
-    cfg ist a dict that must contain: 
-        subs:       list of subject numbers
-        sess:       list of session numbers
-        root:       root bids directory 
-        task:       string of task to analyse
-        deblinding: tsv filename that contains the deblinding
-    returns:        concatenated pandas dataframe
-    """
-    glob_files = glob.glob(search_dir + os.sep + search_pattern)
+    # find files
+    glob_files = sorted(glob.glob(search_dir + os.sep + search_pattern))
+    logging.info(f"Reading data from {search_dir}/{search_pattern}.")
     # read files
     infiles = [pd.read_csv(f, sep=sep) for f in glob_files]
+    
     return pd.concat(infiles, axis=0, ignore_index=True)
 
 
