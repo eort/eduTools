@@ -7,6 +7,7 @@ import autoreject as ar
 import numpy as np
 from mne import (Annotations, read_evokeds, write_evokeds,
                  compute_proj_raw, annotations_from_events,
+                 events_from_annotations,
                  read_vectorview_selection, pick_types)
 from mne.viz import (plot_events, plot_projs_topomap)
 from mne.preprocessing import (ICA, find_bad_channels_maxwell,
@@ -22,31 +23,30 @@ from seaborn import heatmap
 
 from . import io
 
-def annotate_breaks(events, first_time, info, pre_time=1, post_time=3,
-                    block_trg=1, trial_trg=[4]):
+def annotate_breaks(events, first_time, info, pre_time=1.5, post_time=3.5,
+                    block_trg=1, trial_trg=4):
     """Finds the breaks in the experiment and annotates them as bad """
 
     # find all the start block triggers (breaks happen right before)
     start_block = np.where(events[:, 2] == block_trg)[0]
 
+    # when did the pause end?
+    end_times = events[start_block, 0] / info['sfreq'] - pre_time
+
     # move back in the event history to find the end of the previous trial
     start_time = []
     for idx in start_block:
-        while (events[idx, 2] not in trial_trg):
+        while (events[idx, 2] != trial_trg):
             idx -= 1
             # if we are at start of exp, everything before trigger can go
             if idx == 0:
                 break
         # add the times of when the pause starts
-        if idx == 0:
-            # in first block, start 100 ms after recording start
-            start_time.append(first_time + 0.1)
+        if idx == 0 and end_times[0] - first_time > 0:
+            start_time.append(first_time)
         else:
             # in other blocks, start 3 seconds after last stimulus onset
             start_time.append(events[idx, 0] / info['sfreq'] + post_time)
-
-    # when did the pause end?
-    end_times = events[start_block, 0] / info['sfreq'] - pre_time
 
     # duration of the break
     duration = end_times - start_time
@@ -116,9 +116,18 @@ def viz_autorej(reject_log, outpath=None):
             handles.append(patches.Patch(color=img.cmap(img.norm(i)), label=label))
         axes.legend(handles=handles, bbox_to_anchor=(3.5, 0.5), ncol=1,
                           borderaxespad=0.)
-        io.savePlot(fig, outpath=outpath, dpi=600)
+        io.save_plot(fig, outpath=outpath, dpi=600)
         plt.close('all')
 
+def check_epochs(epochs):
+    """
+    Check wether Epochs were falsely marked as bad due to the step "EXCLUDE BAD PERIODS" which marks breaks in the experiment as bad events
+    """
+    epochs.load_data()
+    for ep in epochs.drop_log:
+        if ep: 
+            raise ValueError(("Bad epochs were dropped although "
+                              "there shouldn't have been bad epochs."))
 
 def checkEvents(events, expectedValues, raw, outpath=None, **kwargs):
     """
@@ -140,11 +149,11 @@ def checkEvents(events, expectedValues, raw, outpath=None, **kwargs):
     if outpath:
         fig = plot_events(events, sfreq=raw.info['sfreq'],
                                   first_samp=raw.first_samp, **kwargs)
-        io.savePlot(fig, outpath, dpi=600)
+        io.save_plot(fig, outpath, dpi=600)
         plt.close()
 
 
-def checkErfPerRegion(ep_pre, ep_post, ch_type='mags', 
+def checkErfPerRegion(ep_pre, ep_post, ch_type='mags', baseline=(-0.2, 0),
                       outpath='qc_erp_loc.png'):
     """
     For every NEUROMAG region of the scalp plots the ERPs of a set of epochs
@@ -154,8 +163,8 @@ def checkErfPerRegion(ep_pre, ep_post, ch_type='mags',
     returns:    fig object
     """
 
-    erp_pre = ep_pre.apply_baseline((None, -0.2)).average()
-    erp_post = ep_post.apply_baseline((None, -0.2)).average()
+    erp_pre = ep_pre.apply_baseline(baseline).average()
+    erp_post = ep_post.apply_baseline(baseline).average()
     fig, ax = plt.subplots(8, 2, figsize=(15, 15))
     for erpI, (ID, erp) in enumerate(zip(['pre', 'post'],[erp_pre, erp_post])):
         for chI, chs in enumerate(['Left-frontal', 'Right-frontal',
@@ -167,11 +176,12 @@ def checkErfPerRegion(ep_pre, ep_post, ch_type='mags',
                      axes=ax[chI, erpI], spatial_colors=True)
     fig.suptitle(f'ERPs for each scalp region before (left) and after cleaning'
                  '(right)')
-    io.savePlot(fig, outpath=outpath, dpi=600)
+    io.save_plot(fig, outpath=outpath, dpi=600)
     plt.close('all')
 
 
-def checkPSDPerRegion(ep_pre, ep_post, ch_type='mags', outpath='qc_psd.png'):
+def checkPSDPerRegion(ep_pre, ep_post, ch_type='mags', baseline=(-.5, -.3), 
+                      outpath='qc_psd.png'):
     """
     For every NEUROMAG region of the scalp plots the PSD spectra
     of a set of epochs
@@ -183,7 +193,7 @@ def checkPSDPerRegion(ep_pre, ep_post, ch_type='mags', outpath='qc_psd.png'):
 
     fig, ax = plt.subplots(8, 2, constrained_layout=True, figsize=(15, 15))
     for epI, (ID, ep) in enumerate(zip(['pre', 'post'],[ep_pre, ep_post])):
-        ep.apply_baseline((-.5, -.3))
+        ep.apply_baseline(baseline)
         for chI, chs in enumerate(['Left-frontal', 'Right-frontal',
                                    'Left-temporal', 'Right-temporal',
                                    'Left-parietal', 'Right-parietal',
@@ -199,25 +209,9 @@ def checkPSDPerRegion(ep_pre, ep_post, ch_type='mags', outpath='qc_psd.png'):
     return fig 
 
 
-def classify_components(ica, raw, epochs, mode = 'veog', deriv_stub=None,
+def classify_components(ica, raw, epochs, mode, deriv_stub=None,
                         qc_stub=None):
-    """Find ica components linked to a certain type of artifact."""
-    # try to read the artifact evoked objects from file
-    try: 
-        art_ev = read_evokeds(deriv_stub % f'{mode}_artifact-ave.fif')[0]
-    except FileNotFoundError as e:
-        if mode == 'veog':
-            art_ev = create_eog_epochs(raw, ch_name='EOG127'
-                                                        ).average()
-        elif mode == 'heog':
-            art_ev = create_eog_epochs(raw, ch_name='EOG128'
-                                                        ).average()
-        else:
-            art_ev = create_ecg_epochs(raw).average()
-        write_evokeds(deriv_stub % f'{mode}_artifact-ave.fif', art_ev)
-
-    art_ev.apply_baseline(baseline=(None, -0.2))
-    
+    """Find ica components linked to a certain type of artifact.""" 
     # find artifact-ICA matches
     if mode == 'veog':
         indices, scores = ica.find_bads_eog(raw, ch_name='EOG127',
@@ -232,6 +226,7 @@ def classify_components(ica, raw, epochs, mode = 'veog', deriv_stub=None,
                                             measure='correlation')
 
     ica.exclude = indices
+
     # barplot of ICA component scores
     fig = ica.plot_scores(scores, show=False, labels=mode)
     io.save_plot(fig, dpi=300,
@@ -242,33 +237,47 @@ def classify_components(ica, raw, epochs, mode = 'veog', deriv_stub=None,
         fig = ica.plot_properties(epochs, picks=[idx], show=False)[0]
         io.save_plot(fig, outpath=op.join(qc_stub % f'ica_{idx}_{mode}_'
                                          'diagnose.png'), dpi=300)
+    return indices
+
+
+def plot_artifact(ica, raw, mode, indices, deriv_stub, qc_stub):
+    # try to read the artifact evoked objects from file
+
+    try: 
+        art_ev = read_evokeds(deriv_stub % f'{mode}_artifact-ave.fif')[0]
+    except FileNotFoundError as e:
+        if mode == 'veog':
+            art_ev = create_eog_epochs(raw, ch_name='EOG127').average()
+        elif mode == 'heog':
+            art_ev = create_eog_epochs(raw, ch_name='EOG128').average()
+        elif mode == 'ecg':
+            art_ev = create_ecg_epochs(raw).average()
+        write_evokeds(deriv_stub % f'{mode}_artifact-ave.fif', art_ev)
+
+    art_ev.apply_baseline(baseline=(-0.2, 0))
+
+    ica.exclude = indices
 
     # plot the actual artifact
     art_ev.apply_proj()
-    
-    # catch empty events
     if not np.isnan(art_ev.data).all():
+        ica.exclude = indices
+        # plot the actual artifact
+        art_ev.apply_proj()
         for ch_type in ['grad', 'mag']:
             fig = art_ev.plot_joint(picks=ch_type, show = False)
             io.save_plot(fig, dpi=300, 
-                        outpath=op.join(qc_stub % f'ica_{mode}_artifact_{ch_type}'
-                                        '.png'))
-
+                        outpath=qc_stub % f'ica_{mode}_artifact_{ch_type}.png')
         # plot sources pre and post
         fig = ica.plot_sources(art_ev, show=False)
-        io.save_plot(fig, outpath=op.join(qc_stub % f'ica_{mode}_source.png'),
-                    dpi=300)
+        io.save_plot(fig, outpath=qc_stub % f'ica_{mode}_source.png', dpi=300)
 
         # plot ICs applied to the evoked
         fig = ica.plot_overlay(art_ev, show = False)
-        io.save_plot(fig, outpath=op.join(qc_stub % f'ica_{mode}_corr.png'), dpi=300)
+        io.save_plot(fig, outpath=qc_stub % f'ica_{mode}_corr.png', dpi=300)
         plt.close('all')
-    
     else:
-        logging.info(f"No artifacts of type {mode} found.")
-    ica.exclude = []
-
-    return indices
+        logging.info('No artifacts found!')
 
 
 def compute_ER_SSP(er_path, n_grad=3, n_mag=5, outpath=None):
@@ -406,7 +415,7 @@ def filtering(raw, l_freq=None, h_freq=None, freqs=None, picks=None, fmin=0.1,
     l_freq/h_freq and freqs are mutually exclusive
     """
 
-    fig, ax = plt.subplots(2, 2, constrained_layout=True, figsize=(15, 7.5))
+    fig, ax = plt.subplots(2, 2, figsize=(15, 7.5))
     raw.plot_psd(xscale='log', fmin=fmin, fmax=fmax, average=False, show=False,
                  ax=ax[:2, 0])
     if freqs is None:
@@ -601,6 +610,89 @@ def interpolate_autoreject(epochs, ar_obj):
     return epochs
 
 
+def filter_events(events, event_dict, label, mode=None, extra_label=None):
+    """From all events select a subset based on label
+
+    To simplify code, label needs to be an interable!
+
+    Function is quite idiosyncratic at the moment, specifically decided for HHU 
+    MEG (key press at any time possible), for the RDM task (see stim
+    trigger values). Perhaps we fix it at another time. 
+
+    """
+
+    if not isinstance(label, (list, tuple, np.ndarray)):
+        raise ValueError('label must be a list or array or other sequence!')
+
+    trigger = []
+    for trg in label: 
+        trigger.append(event_dict[trg])
+
+    if mode is None:
+        stim = events[np.where(np.isin(events[:, 2], trigger))[0]]
+        sid = {k:v for (k, v) in event_dict.items() if v in trigger}
+
+    # if an event depends on another depend happening earlier
+    elif mode == 'pre':
+        targets = np.where(np.isin(events[:, 2], trigger))[0]
+        priors = targets - 1
+        stimulus = np.isin(events[priors,2], extra_label)
+        priors = priors[stimulus,]
+        stim = events[priors + 1,]
+        sid = {k:v for (k, v) in event_dict.items() if v in trigger}
+
+    # if an event depends on another depend happening later
+    elif mode == 'post':
+        targets = np.where(np.isin(events[:, 2], trigger))[0]
+        posts = targets + 1
+        # make sure the posts index won't exceed array
+        posts = posts[:events.shape[0]]
+        stimulus = np.isin(events[posts,2], extra_label)
+        posts = posts[stimulus,]
+        stim = events[posts - 1,]
+        sid = {k:v for (k, v) in event_dict.items() if v in trigger}
+
+    return stim.astype(int), sid
+
+def read_events(raw, bids_path):
+    """Reads events in a robust-ish way. 
+
+    Some subjects have weird events happening (double key presses, keypress
+    during stimulus onset, etc.). This function is based on manual inspection
+    and fixes erroneous events. Either by removing them or recoding them.
+    """    
+
+    # load event tsv
+    sub = bids_path.subject
+    ses = bids_path.session
+    task = bids_path.task
+    tsv = op.join(op.dirname(bids_path), 
+                 f'sub-{sub}_ses-{ses}_task-{task}_events.tsv')
+    event_df = pd.read_csv(tsv, sep='\t')
+
+    # extract unique events
+    unique_events = event_df.value.unique()
+    unique_ids = event_df.trial_type.unique()
+    event_dict = {k:v for (k,v) in zip(unique_ids,unique_events)}
+
+    # load events
+    events, event_dict = events_from_annotations(raw, event_dict)
+
+    # in case it is known that something is wrong with a specific sub/ses
+    # fix it (based on manual inspection)
+    if sub == '19' and ses == '02':
+        new_events = np.zeros((events.shape[0] - 2, events.shape[1]))
+        new_events[:1370, :] = events[:1370, :]
+        new_events[1370:, :] = events[1372:, :]
+        events = new_events
+    elif sub == '21' and ses == '03':
+        events[1864, 2] = 4
+    elif 'undefined_1' in event_dict.keys():
+        logging.warning("There are undefined events. Make sure that is okay")
+    
+    return events, event_dict
+
+
 def load_misses(epochs, path, ses_info=None):
     """Based on behav task/session return index of bad responses
 
@@ -632,19 +724,14 @@ def load_misses(epochs, path, ses_info=None):
         - make that file (requires manual inspection of the data file)
         - implement the procedure, subjectwise
         """
-        if path.subject == '19' and path.session == '02':
-            epochs.events.drop(labels = 1370, axis = 0, inplace = True)
-        elif path.subject == '21' and path.session == '03':
-            epochs.events.at[1866, 'value'] = 4
-            epochs.events.at[1866, 'trial_type'] = 'noise'
-        else:
-            raise ValueError("Data file is not complete! Check data manually!")
+        raise ValueError("Data file is not complete! Check data manually!")
 
     # otherwise return the indices of the missed responses
     return list(df.loc[pd.isnull(df.resp_key), :].index)
 
 
-def plot_diagnostic_ERF(dirty_ep, clean_ep, filter, outpath=None):
+def plot_diagnostic_ERF(dirty_ep, clean_ep, filter, baseline=(-0.2, 0),
+                        outpath=None):
     """some simple ERF comparison plot"""
 
     l_oc_grad = getNeuromagRegions(dirty_ep, ['Left-occipital'], exclude=True,
@@ -657,10 +744,8 @@ def plot_diagnostic_ERF(dirty_ep, clean_ep, filter, outpath=None):
                                   ch_type='mags')
     comparisons = [[l_oc_grad, r_oc_grad], [l_oc_mag, r_oc_mag]]
 
-    dirty_ev = dirty_ep.average().apply_baseline(baseline = (-0.2, 0))
-    dirty_ev = dirty_ev.crop(-.3, 1.6)
-    clean_ev = clean_ep.average().apply_baseline(baseline = (-0.2, 0))
-    clean_ev = clean_ev.crop(-.3, 1.6)
+    dirty_ev = dirty_ep.average().apply_baseline(baseline = baseline)
+    clean_ev = clean_ep.average().apply_baseline(baseline = baseline)
     stim_times = [-0.2,0,0.1,0.2,0.4,1]
     title_id = [['Gradiometers - dirty','Gradiometers - clean'],
                 ['Magnetometers - dirty', 'Magnetometers - clean']]
@@ -673,7 +758,7 @@ def plot_diagnostic_ERF(dirty_ep, clean_ep, filter, outpath=None):
             ax[evI, axI].tick_params(axis='x', which='both', top='off')
             ax[evI, axI].tick_params(axis='y', which='both', right='off')
             picks = pick_types(ev.info, meg=['grad', 'mag'][axI], 
-                                   stim=False, eog=False, exclude=[])
+                               stim=False, eog=False, exclude=[])
             ev.plot(picks, exclude=[], axes=ax[evI, axI], show=False)
             ax[evI, axI].axhline(0, linewidth=.6, linestyle='--', color='black')
             ax[evI, axI].axvline(0, linewidth=.6, linestyle='--', color='black')
@@ -716,7 +801,7 @@ def plot_diagnostic_ERF(dirty_ep, clean_ep, filter, outpath=None):
     plt.close('all')
 
 
-def plot_diagnostic_TF(dirty_ep, clean_ep, outpath):
+def plot_diagnostic_TF(dirty_ep, clean_ep, outpath, baseline=(-.5, -.3)):
     """Simple diagnostic timefrequency plot"""
     freqs = np.logspace(*np.log10([4, 100]), num=20)
     n_cycles = freqs / 2. 
@@ -728,7 +813,7 @@ def plot_diagnostic_TF(dirty_ep, clean_ep, outpath):
 
     for epI, ep in enumerate([dirty_ep, clean_ep]):
         preproc = ['dirty', 'clean'][epI]
-        ep.apply_baseline((-.5, -.3))
+        ep.apply_baseline(baseline)
 
         power = tfr_morlet(ep, use_fft=True, freqs=freqs,
                                          n_cycles=n_cycles, return_itc=False)

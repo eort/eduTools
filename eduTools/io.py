@@ -3,10 +3,44 @@
 import os
 import json
 import sys
-from IPython import embed as shell
 import glob
 import pandas as pd
 import logging
+
+def concatenate_text_files(search_dir, search_pattern, sep='\t'):
+    """Combines all files that match the pattern in a single dataframe
+
+    Parameters
+    ----------
+    search_dir : Path-like | String
+        directory where the to-be-concatenated files will be search for
+    search_pattern : String
+        Glob pattern that will be used to detect files
+    sep : String
+        what delimiting values are used in the files to be concatenated
+    """
+    # find files
+    glob_files = sorted(glob.glob(search_dir + os.sep + search_pattern))
+    logging.info(f"Reading data from {search_dir}/{search_pattern}.")
+    # read files
+    infiles = [pd.read_csv(f, sep=sep) for f in glob_files]
+    
+    return pd.concat(infiles, axis=0, ignore_index=True)
+
+
+def parse_bids_path(filename):
+    """based on a filepath extract root, sub, ses, and task
+
+    returns dictionary key:value"""
+    dirname, basename = os.path.split(filename)
+
+    elements = {'root':dirname.split('/')[0]}
+    for item in basename.split('_')[:-1]:
+        k, v = item.split('-')
+        elements[k] = v
+        
+    return elements
+
 
 def read_json(fname):
     """Save reading of json files
@@ -20,9 +54,16 @@ def read_json(fname):
         with open(fname, 'r') as f:    
             info = json.load(f)
     except FileNotFoundError:
-        error(f"File {fname} was not found! Stop procedure")
+        raise FileNotFoundError(f"File {fname} was not found!")
         sys.exit(1)
     return info
+
+
+def save_plot(fig, outpath, **kwargs):
+    """ Convenience wrapper for saving plots. """
+    os.makedirs(os.path.dirname(outpath), exist_ok=True)
+    fig.savefig(outpath, **kwargs)
+
 
 def write_json(fname, data=None):
     """ Save reading and writing of json files
@@ -56,33 +97,3 @@ def write_json(fname, data=None):
     # and write to file
     with open(fname, 'w') as f:
         json.dump(temp_data, f, sort_keys=True, indent=4)
-
-
-def save_plot(fig, outpath, **kwargs):
-    """ Convenience wrapper for saving plots. """
-    os.makedirs(os.path.dirname(outpath), exist_ok=True)
-    fig.savefig(outpath, **kwargs)
-
-
-def concatenate_text_files(search_dir, search_pattern, sep='\t'):
-    """Combines all files that match the pattern in a single dataframe
-
-    Parameters
-    ----------
-    search_dir : Path-like | String
-        directory where the to-be-concatenated files will be search for
-    search_pattern : String
-        Glob pattern that will be used to detect files
-    sep : String
-        what delimiting values are used in the files to be concatenated
-    """
-    # find files
-    glob_files = sorted(glob.glob(search_dir + os.sep + search_pattern))
-    logging.info(f"Reading data from {search_dir}/{search_pattern}.")
-    # read files
-    infiles = [pd.read_csv(f, sep=sep) for f in glob_files]
-    
-    return pd.concat(infiles, axis=0, ignore_index=True)
-
-
-
