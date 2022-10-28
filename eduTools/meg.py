@@ -4,6 +4,7 @@ import logging
 from datetime import timedelta
 
 import autoreject as ar
+from autoreject import read_auto_reject
 import numpy as np
 from mne import (Annotations, read_evokeds, write_evokeds,
                  compute_proj_raw, annotations_from_events,
@@ -15,13 +16,27 @@ from mne.preprocessing import (ICA, find_bad_channels_maxwell,
 from mne.time_frequency import tfr_morlet
 import mne_bids as mb
 import pandas as pd
+from pandas import read_csv
 
 import matplotlib.colors as colors
 import matplotlib.patches as patches
 import matplotlib.pyplot as plt
 from seaborn import heatmap
 
-from . import io
+from . import plot as pt
+
+
+def add_metadata(ep, beh_path, meta_info):
+    event_df = read_csv(beh_path, sep='\t', usecols=meta_info['usecols'])
+    if meta_info['n_trials'] == ep.events.shape[0]:
+        ep.metadata = event_df
+    else:
+        raise NotImplementedError("Non-standard subject! Fixing necessary!")
+        fix_trialcount_epoch(ep)
+    return ep
+
+def fix_trialcount_epoch(ep):
+    return ep
 
 def annotate_breaks(events, first_time, info, pre_time=1.5, post_time=3.5,
                     block_trg=1, trial_trg=4):
@@ -55,70 +70,6 @@ def annotate_breaks(events, first_time, info, pre_time=1.5, post_time=3.5,
     return Annotations(start_time, duration, 'BAD_break', info['meas_date'])
 
 
-def run_autorej(epochs, picks, n_jobs=1, seed=10, outpath=None):
-    """Use autoreject (local) to find bad and maybe fix epochs"""
-
-    # set parameters for autoreject
-    n_interpolates = np.array((1, 2, 3, 5, 7, 9))
-    consensus_percs = np.linspace(0, 1, 11)
-
-    # init autoreject object
-    rej = ar.AutoReject(n_interpolates, consensus_percs, picks=picks,
-                        thresh_method='bayesian_optimization',
-                        random_state=seed, n_jobs=n_jobs, verbose=False)
-
-    # run the autoreject (local) algorithm
-    rej.fit(epochs)
-
-    # extract the log file
-    rej_log = rej.get_reject_log(epochs)
-
-    # plot the results
-    viz_autorej(rej_log, outpath=outpath)
-
-    # return it 
-    return rej, rej_log
-
-
-def viz_autorej(reject_log, outpath=None):
-    """
-    Solutions for both gradiometers and magnetometers are combined here. 
-    Exclusion of bad channels will be done later. Here only the bad epoch
-    indices are noted
-
-    reject_log:     RejectLog
-        Log object as produced by autoreject
-    outpath:    str, Path
-        path to save the qc plot to
-    """
-
-    # plot channel x epoch image with info on good, bad, interpolation
-    if outpath != None:      
-        fig, axes = plt.subplots(1, 1, figsize=(18, 24), dpi=1200)    
-        # prep
-        xlabels = reject_log.ch_names
-        image = reject_log.labels
-        image[image == 2] = 0.5  # move interp to 0.5
-        legend_label = {0: 'good', 0.5: 'interpolated', 1: 'bad'}
-        cmap = colors.ListedColormap(['white', 'blue', 'red'])
-        # plot
-        img = axes.imshow(image.T, cmap=cmap, vmin=0, vmax=1, interpolation='none')
-        axes.set(xlabel='Epochs', ylabel='Channels')
-        plt.setp(axes, yticks=range(0, len(xlabels)), yticklabels=xlabels)
-        plt.setp(axes.get_yticklabels(), fontsize=2)
-        #add red box around rejected epochs
-        for idx in np.where(reject_log.bad_epochs)[0]:
-            axes.add_patch(patches.Rectangle((idx - 0.5, -0.5), 1, len(xlabels),
-                         linewidth=1, edgecolor='r', facecolor='none'))
-        # add legend
-        handles = []
-        for i, label in legend_label.items():
-            handles.append(patches.Patch(color=img.cmap(img.norm(i)), label=label))
-        axes.legend(handles=handles, bbox_to_anchor=(3.5, 0.5), ncol=1,
-                          borderaxespad=0.)
-        io.save_plot(fig, outpath=outpath, dpi=600)
-        plt.close('all')
-
 def check_epochs(epochs):
     """
     Check wether Epochs were falsely marked as bad due to the step "EXCLUDE BAD PERIODS" which marks breaks in the experiment as bad events
@@ -149,8 +100,7 @@ def checkEvents(events, expectedValues, raw, outpath=None, **kwargs):
     if outpath:
         fig = plot_events(events, sfreq=raw.info['sfreq'],
                                   first_samp=raw.first_samp, **kwargs)
-        io.save_plot(fig, outpath, dpi=600)
-        plt.close()
+        pt.save_plot(fig, outpath, dpi=600)
 
 
 def checkErfPerRegion(ep_pre, ep_post, ch_type='mags', baseline=(-0.2, 0),
@@ -176,8 +126,7 @@ def checkErfPerRegion(ep_pre, ep_post, ch_type='mags', baseline=(-0.2, 0),
                      axes=ax[chI, erpI], spatial_colors=True)
     fig.suptitle(f'ERPs for each scalp region before (left) and after cleaning'
                  '(right)')
-    io.save_plot(fig, outpath=outpath, dpi=600)
-    plt.close('all')
+    pt.save_plot(fig, outpath=outpath, dpi=600)
 
 
 def checkPSDPerRegion(ep_pre, ep_post, ch_type='mags', baseline=(-.5, -.3), 
@@ -199,14 +148,14 @@ def checkPSDPerRegion(ep_pre, ep_post, ch_type='mags', baseline=(-.5, -.3),
                                    'Left-parietal', 'Right-parietal',
                                    'Left-occipital', 'Right-occipital']):
             picks = getNeuromagRegions(ep, chs, exclude=True, ch_type=ch_type)
-            ep.plot_psd(picks=picks, fmin=2, fmax=120, show=False,
-                        ax=ax[chI, epI], spatial_colors=True)
+            ep.info['bads'] = [] 
+            psd = ep.compute_psd(fmin=2, fmax=120)
+            psd.plot(picks=picks, show=False, axes=ax[chI, epI],
+                     spatial_colors=True)
             ax[chI, epI].set_title(f'{chs}_{ID}')
     fig.suptitle(f'PSDs for each scalp region before (left) and after cleaning'
                  '(right)')
-    io.save_plot(fig, outpath=outpath, dpi=600)
-    plt.close('all')
-    return fig 
+    pt.save_plot(fig, outpath=outpath, dpi=600)
 
 
 def classify_components(ica, raw, epochs, mode, deriv_stub=None,
@@ -229,13 +178,13 @@ def classify_components(ica, raw, epochs, mode, deriv_stub=None,
 
     # barplot of ICA component scores
     fig = ica.plot_scores(scores, show=False, labels=mode)
-    io.save_plot(fig, dpi=300,
+    pt.save_plot(fig, dpi=300,
                 outpath=op.join(qc_stub % f'ica_{mode}_scores.png'))
 
     # plot diagnostics
     for idx in indices:
         fig = ica.plot_properties(epochs, picks=[idx], show=False)[0]
-        io.save_plot(fig, outpath=op.join(qc_stub % f'ica_{idx}_{mode}_'
+        pt.save_plot(fig, outpath=op.join(qc_stub % f'ica_{idx}_{mode}_'
                                          'diagnose.png'), dpi=300)
     return indices
 
@@ -266,16 +215,15 @@ def plot_artifact(ica, raw, mode, indices, deriv_stub, qc_stub):
         art_ev.apply_proj()
         for ch_type in ['grad', 'mag']:
             fig = art_ev.plot_joint(picks=ch_type, show = False)
-            io.save_plot(fig, dpi=300, 
+            pt.save_plot(fig, dpi=300, 
                         outpath=qc_stub % f'ica_{mode}_artifact_{ch_type}.png')
         # plot sources pre and post
         fig = ica.plot_sources(art_ev, show=False)
-        io.save_plot(fig, outpath=qc_stub % f'ica_{mode}_source.png', dpi=300)
+        pt.save_plot(fig, outpath=qc_stub % f'ica_{mode}_source.png', dpi=300)
 
         # plot ICs applied to the evoked
         fig = ica.plot_overlay(art_ev, show = False)
-        io.save_plot(fig, outpath=qc_stub % f'ica_{mode}_corr.png', dpi=300)
-        plt.close('all')
+        pt.save_plot(fig, outpath=qc_stub % f'ica_{mode}_corr.png', dpi=300)
     else:
         logging.info('No artifacts found!')
 
@@ -297,8 +245,7 @@ def compute_ER_SSP(er_path, n_grad=3, n_mag=5, outpath=None):
     er = mb.read_raw_bids(er_path)
     ax = er.plot_psd(average=True, spatial_colors=False,
                      dB=False, xscale='log', show=False)
-    io.save_plot(ax, outpath.format('absNoise'), dpi=600)
-    plt.close('all')
+    pt.save_plot(ax, outpath.format('absNoise'), dpi=600)
     er.plot(show=True, block=True, duration=60, n_channels=60)
     orig_projs = er.info['projs']
 
@@ -311,47 +258,59 @@ def compute_ER_SSP(er_path, n_grad=3, n_mag=5, outpath=None):
         # visualize system projections
         fig = plot_projs_topomap(orig_projs, colorbar=True,
                                  vlim='joint', info=er.info, show=False)
-        io.save_plot(fig, outpath.format('proj_orig'), dpi=600)
+        pt.save_plot(fig, outpath.format('proj_orig'), dpi=600)
         # visualize new projections
         fig = plot_projs_topomap(er_projs, colorbar=True,
                                  vlim='joint', info=er.info, show=False)
-        io.save_plot(fig, outpath.format('proj_ER'), dpi=600)
-        plt.close('all')
-    
+        pt.save_plot(fig, outpath.format('proj_ER'), dpi=600)
     return er_projs
 
 
-def compute_ICA(epochs, l_freq=1, n_components=30, random_state=97,
-                qc_stub=None):
+def compute_ICA(epochs, AR_settings, l_freq=1, n_components=50,
+                random_state=97, n_jobs=1, qc_stub=None):
     """ Convenience wrapper around running an ICA"""
 
     # highpass to avoid low drift noise
-    ica_ep = epochs.copy().load_data().filter(l_freq=l_freq, h_freq=None)
+    epochs = epochs.load_data().filter(l_freq=l_freq, h_freq=None)
 
+    if AR_settings['apply_ar'] == 'run':
+        logging.info("Exclude noise in data prior to ICA")
+        megs = pick_types(epochs.info, meg=True, eeg=False)
+        rej, _ = run_autorej(epochs, megs, n_jobs, random_state)
+        rej.save(AR_settings['ar_path'], overwrite=True)
+        epochs = rej.transform(epochs)        
+    elif AR_settings['apply_ar'] == 'load':
+        logging.info("Load autoreject solution.")
+        # load data
+        rej = read_auto_reject(AR_settings['ar_path'])
+        epochs = rej.transform(epochs)
+    else:
+        logging.info("Step skipped: No noisy epochs marked")
+    
     # run ICA
-    ica = ICA(n_components=n_components, max_iter='auto',
-                                random_state=random_state)
-    ica.fit(ica_ep)
+    ica = ICA(n_components=n_components, max_iter='auto', method='picard',
+              random_state=random_state)
+    ica.fit(epochs)
 
     logging.info("Fitting ICA finished. Plot some diagnostics\n")
     if qc_stub: 
         # plot components
         figs = ica.plot_components(show=False)
-        for fI, fig in enumerate(figs,1):
-            io.save_plot(fig, qc_stub % f'ica_components_topo-{fI}.png',
-                        dpi=300)
-            plt.close()
+        for fI, fig in enumerate(figs, 1):
+            pt.save_plot(fig, qc_stub % f'ica_components-{fI}.png',
+                         dpi=300)
         
         # plot sources
+        '''
         n_plots = int(np.ceil(n_components / 17))
         for idx in range(n_plots):
             start_idx = idx * 17
             stop_idx = min((idx + 1) * 17, n_components)
             picks = list(range(start_idx, stop_idx))
-            fig = ica.plot_sources(ica_ep, picks=picks, show_scrollbars=False,
+            fig = ica.plot_sources(epochs, picks=picks, show_scrollbars=False,
                                    show=False)
-            io.save_plot(fig, qc_stub % f'ica_sources-{idx}.png', dpi=600)
-            plt.close()
+            pt.save_plot(fig, qc_stub % f'ica_sources-{idx}.png', dpi=600)
+        '''
     return ica
 
 
@@ -414,10 +373,10 @@ def filtering(raw, l_freq=None, h_freq=None, freqs=None, picks=None, fmin=0.1,
     if freq is defined, do notch filtering
     l_freq/h_freq and freqs are mutually exclusive
     """
+    fig, ax = plt.subplots(2, 2, figsize=(15, 7.5), sharex=True, sharey=True)
+    psd = raw.compute_psd(fmin=fmin, fmax=fmax)
+    psd.plot(xscale='log', average=False, show=False, axes=ax[:2, 0])
 
-    fig, ax = plt.subplots(2, 2, figsize=(15, 7.5))
-    raw.plot_psd(xscale='log', fmin=fmin, fmax=fmax, average=False, show=False,
-                 ax=ax[:2, 0])
     if freqs is None:
         logging.info("Do low/high/bandpass filtering")
         raw.filter(l_freq=l_freq, h_freq=h_freq, **filter_settings)
@@ -425,23 +384,17 @@ def filtering(raw, l_freq=None, h_freq=None, freqs=None, picks=None, fmin=0.1,
         logging.info("Do notch filtering")
         raw.notch_filter(freqs=freqs, picks=picks)
 
-    ax2 = raw.plot_psd(xscale='log', fmin=fmin, fmax=fmax, average=False,
-                       show=False, ax=ax[:2, 1], **filter_settings)
-    ax2.axes[1].set_title('Magnetometers')
-    ax2.axes[3].set_title('Gradiometers')
-    ax2.axes[2].set_xlabel('Frequency (Hz)')
-    ax2.axes[3].set_xlabel('Frequency (Hz)')
-    ax2.axes[0].set_title('Magnetometers')
-    ax2.axes[2].set_title('Gradiometers')
+    psd = raw.compute_psd(fmin=fmin, fmax=fmax)
+    psd.plot(xscale='log', average=False, show=False, axes=ax[:2, 1])
+
     fig.suptitle('Unfiltered (left) and filtered (right) raw power spectra')
-    for axis in ax2.axes[:4]:
+    for axis in ax.flatten():
         if l_freq:
             axis.axvline(x=l_freq, ls='--', color='black')
         if h_freq:
             axis.axvline(x=h_freq, ls='--', color='black')
 
-    io.save_plot(fig, outpath, dpi=600)
-    plt.close()
+    pt.save_plot(fig, outpath, dpi=600)
     return raw
 
 
@@ -484,7 +437,7 @@ def find_bad_channels(raw, crosstalk_f, fine_cal_f, limit=3, duration=3,
         ax[1].set_title('Scores > Limit', fontweight='bold')
 
         # save figure
-        io.save_plot(fig, outpath, dpi=600)
+        pt.save_plot(fig, outpath, dpi=600)
     return noisy + flat
 
 
@@ -665,10 +618,8 @@ def read_events(raw, bids_path):
     # load event tsv
     sub = bids_path.subject
     ses = bids_path.session
-    task = bids_path.task
-    tsv = op.join(op.dirname(bids_path), 
-                 f'sub-{sub}_ses-{ses}_task-{task}_events.tsv')
-    event_df = pd.read_csv(tsv, sep='\t')
+    
+    event_df = read_csv(bids_path.fpath, sep='\t')
 
     # extract unique events
     unique_events = event_df.value.unique()
@@ -693,7 +644,7 @@ def read_events(raw, bids_path):
     return events, event_dict
 
 
-def load_misses(epochs, path, ses_info=None):
+def load_misses(epochs):
     """Based on behav task/session return index of bad responses
 
     Assumes bids file structure, response coded as "resp_key", and
@@ -711,7 +662,7 @@ def load_misses(epochs, path, ses_info=None):
     # read data
     path.datatype = 'beh'
     beh_path = path.fpath
-    df = pd.read_csv(str(beh_path) + '_beh.tsv', sep='\t')
+    df = read_csv(str(beh_path) + '_beh.tsv', sep='\t')
 
     # if some trials are missing (because some idiot forgot to record on time)
     if epochs.events.shape[0] != n_trials:
@@ -766,7 +717,7 @@ def plot_diagnostic_ERF(dirty_ep, clean_ep, filter, baseline=(-0.2, 0),
             ax[evI, axI].set_ylabel('Amplitude (MEG unit)')
             ax[evI, axI].set_xlabel('Time (s)')
     plt.tight_layout()
-    io.save_plot(fig, outpath=outpath.replace('erf', 'erf_allCh'), dpi=600)
+    pt.save_plot(fig, outpath=outpath.replace('erf', 'erf_allCh'), dpi=600)
 
     # some visual ERP 
     fig, ax = plt.subplots(2, 2, constrained_layout=True, figsize=(10, 5),
@@ -784,21 +735,20 @@ def plot_diagnostic_ERF(dirty_ep, clean_ep, filter, baseline=(-0.2, 0),
             ax[cI, evI].axhline(0, linewidth=0.6, linestyle='--', color='black')
             ax[cI, evI].axvline(0, linewidth=0.6, linestyle='--', color='black')
             ax[cI, evI].set_title(f'Lateralized OCC ERF - {title_id[cI][evI]}')
-    io.save_plot(fig, outpath, dpi=600)
+    pt.save_plot(fig, outpath, dpi=600)
 
     for evI, ev in enumerate([dirty_ev, clean_ev]):
         preproc = ['dirty', 'clean'][evI]
         fig_topo = ev.plot_topomap(times=stim_times, ch_type='grad',
                                     colorbar = True, show=False)
-        io.save_plot(fig_topo, outpath.replace('erf_prepost', 
+        pt.save_plot(fig_topo, outpath.replace('erf_prepost', 
                                               f'erf_grad_topo_{preproc}'),
                     dpi=600)
         fig_topo = ev.plot_topomap(times=stim_times, ch_type='mag',
                                     colorbar = True, show=False)
-        io.save_plot(fig_topo, outpath.replace('erf_prepost',
+        pt.save_plot(fig_topo, outpath.replace('erf_prepost',
                                               f'erf_mag_topo_{preproc}'),
                     dpi=600)
-    plt.close('all')
 
 
 def plot_diagnostic_TF(dirty_ep, clean_ep, outpath, baseline=(-.5, -.3)):
@@ -839,25 +789,94 @@ def plot_diagnostic_TF(dirty_ep, clean_ep, outpath, baseline=(-.5, -.3)):
                                mode='logratio', axes=ax_topo[i // 2, i % 2],
                                title=freq, show=False)
             i += 1
-        io.save_plot(fig_topo, outpath.replace('tf_prepost',
+        pt.save_plot(fig_topo, outpath.replace('tf_prepost',
                                               f'tf_topo_{preproc}'),
                     dpi=600)
-        plt.close()
+    pt.save_plot(fig, outpath, dpi=600)
 
-    io.save_plot(fig, outpath, dpi=600)
-    plt.close('all')
+
+
+def run_autorej(epochs, picks, n_jobs=1, seed=10, outpath=None):
+    """Use autoreject (local) to find bad and maybe fix epochs"""
+
+    # set parameters for autoreject
+    #n_interpolates = np.array((1, 3, 6, 9))
+    #consensus_percs = np.linspace(0, 1, 9)
+    n_interpolates = np.array((1, 2, 3, 5, 7, 9))
+    consensus_percs = np.linspace(0, 0.9, 10)
+
+
+    # init autoreject object
+    rej = ar.AutoReject(n_interpolates, consensus_percs, picks=picks,
+                        thresh_method='bayesian_optimization',
+                        random_state=seed, n_jobs=n_jobs, verbose=2)
+
+    # run the autoreject (local) algorithm
+    rej.fit(epochs)
+
+    # extract the log file
+    rej_log = rej.get_reject_log(epochs)
+
+    # plot the results
+    if outpath is not None:
+        viz_autorej(rej_log, outpath=outpath)
+
+    # return it 
+    return rej, rej_log
+
+
+def viz_autorej(reject_log, outpath):
+    """
+    Solutions for both gradiometers and magnetometers are combined here. 
+    Exclusion of bad channels will be done later. Here only the bad epoch
+    indices are noted
+
+    reject_log:     RejectLog
+        Log object as produced by autoreject
+    outpath:    str, Path
+        path to save the qc plot to
+    """
+
+    # plot channel x epoch image with info on good, bad, interpolation
+    fig, axes = plt.subplots(1, 1, figsize=(18, 24), dpi=1200)    
+    # prep
+    xlabels = reject_log.ch_names
+    image = reject_log.labels
+    image[image == 2] = 0.5  # move interp to 0.5
+    legend_label = {0: 'good', 0.5: 'interpolated', 1: 'bad'}
+    cmap = colors.ListedColormap(['white', 'blue', 'red'])
+    # plot
+    img = axes.imshow(image.T, cmap=cmap, vmin=0, vmax=1, interpolation='none')
+    axes.set(xlabel='Epochs', ylabel='Channels')
+    plt.setp(axes, yticks=range(0, len(xlabels)), yticklabels=xlabels)
+    plt.setp(axes.get_yticklabels(), fontsize=2)
+    #add red box around rejected epochs
+    for idx in np.where(reject_log.bad_epochs)[0]:
+        axes.add_patch(patches.Rectangle((idx - 0.5, -0.5), 1, len(xlabels),
+                     linewidth=1, edgecolor='r', facecolor='none'))
+    # add legend
+    handles = []
+    for i, label in legend_label.items():
+        handles.append(patches.Patch(color=img.cmap(img.norm(i)), label=label))
+    axes.legend(handles=handles, bbox_to_anchor=(3.5, 0.5), ncol=1,
+                      borderaxespad=0.)
+    pt.save_plot(fig, outpath=outpath, dpi=600)
 
 
 def zapline(raw, line_freq=50, sample_freq=1000, nremove=10, outpath=None):
 
     from meegkit.dss import dss_line
 
-    # pre filter figure
-    fig, ax = plt.subplots(2, 2, figsize=(15, 7.5))
-    raw.plot_psd(xscale='log', average=False, show=False, ax=ax[:2, 0])
+    # pre filter power spectrum
+    fig, ax = plt.subplots(2, 2, figsize=(15, 7.5), sharex=True, sharey=True)
+    psd = raw.compute_psd()
+    psd.plot(xscale='log', average=False, show=False, axes=ax[:2, 0])
+
     mag_picks = pick_types(raw.info, meg='mag', eeg=False)
     planar1_picks = pick_types(raw.info, meg='planar1', eeg=False)
     planar2_picks = pick_types(raw.info, meg='planar2', eeg=False)
+
+    # do every channel type one by one to save memory
     data = raw.get_data(picks=mag_picks)
     raw._data[mag_picks] = dss_line(data.T, fline=line_freq, sfreq=sample_freq,
                                 nremove=10)[0].T
@@ -869,18 +888,10 @@ def zapline(raw, line_freq=50, sample_freq=1000, nremove=10, outpath=None):
     raw._data[planar2_picks] = dss_line(data.T, fline=line_freq, 
                                         sfreq=sample_freq,
                                         nremove=10)[0].T
-    
-    # post filter figure
-    ax2 = raw.plot_psd(xscale='log', average=False, show=False, ax=ax[:2, 1])
-    ax2.axes[3].set_title('Gradiometers')
-    ax2.axes[1].set_title('Magnetometers')
-    ax2.axes[2].set_xlabel('Frequency (Hz)')
-    ax2.axes[3].set_xlabel('Frequency (Hz)')
-    ax2.axes[0].set_title('Magnetometers')
-    ax2.axes[2].set_title('Gradiometers')    
-    fig.suptitle('Unfiltered (left) and filtered (right) raw power spectra')
-    io.save_plot(fig, outpath, dpi=600)
-    plt.close()
+    # post filter power spectrum
+    psd = raw.compute_psd()
+    psd.plot(xscale='log', average=False, show=False, axes=ax[:2, 1])
 
+    fig.suptitle('Unfiltered (left) and filtered (right) raw power spectra')
+    pt.save_plot(fig, outpath, dpi=600)
     return raw
-    

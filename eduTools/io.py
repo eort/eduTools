@@ -6,6 +6,7 @@ import sys
 import glob
 import pandas as pd
 import logging
+import matplotlib.pyplot as plt
 
 def concatenate_text_files(search_dir, search_pattern, sep='\t'):
     """Combines all files that match the pattern in a single dataframe
@@ -57,12 +58,6 @@ def read_json(fname):
         raise FileNotFoundError(f"File {fname} was not found!")
         sys.exit(1)
     return info
-
-
-def save_plot(fig, outpath, **kwargs):
-    """ Convenience wrapper for saving plots. """
-    os.makedirs(os.path.dirname(outpath), exist_ok=True)
-    fig.savefig(outpath, **kwargs)
 
 
 def write_json(fname, data=None):

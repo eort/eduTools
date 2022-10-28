@@ -1,6 +1,9 @@
 import pandas as pd
+import glob
+import os
+from eduTools.io import read_json
 
-def add_deblinding(df, src_file, keys, target):
+def add_deblinding(df, drug_df, keys, target):
     """Combines a dataframe with trial info with a dataframe with session info
 
     Specifically, the indices and columns in src_file are used as values to add
@@ -20,11 +23,21 @@ def add_deblinding(df, src_file, keys, target):
     target : String
         Name of column that receives the additional information
     """
-    # read src_file
-    deblind = pd.read_csv(src_file, index_col=0, header=None, sep='\t')
-
     # loop over unique values and add the info in src_file to the df
-    for sub in deblind.index:
-        for ses in deblind.columns:
-            df.loc[(df[keys[0]] == sub) & (df[keys[1]] == ses), target] = deblind.loc[sub, ses]
+    for (sub, ses) in drug_df.index:
+        df.loc[(df[keys[0]] == sub) & \
+               (df[keys[1]] == ses), target] = drug_df.loc[(sub, ses), 'drug']
+    return df
+
+
+def extract_drug_info(search_dir, search_pattern):
+    """looks for a drug field in collection"""
+    df = pd.DataFrame(columns=['drug'], index=pd.MultiIndex(levels=[[], []], 
+                                                            codes=[[], []]))
+    glob_files = sorted(glob.glob(search_dir + os.sep + search_pattern))
+    for file in glob_files:
+        json = read_json(file)
+        sub = json['subject']
+        ses = json['session']
+        df.loc[(sub, ses), 'drug'] = json['drug']
     return df
