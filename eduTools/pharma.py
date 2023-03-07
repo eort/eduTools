@@ -25,13 +25,13 @@ def add_deblinding(df, drug_df, keys, target):
     """
     # loop over unique values and add the info in src_file to the df
     for (sub, ses) in drug_df.index:
-        df.loc[(df[keys[0]] == sub) & \
-               (df[keys[1]] == ses), target] = drug_df.loc[(sub, ses), 'drug']
+        df.loc[(sub, ses), target] = drug_df.loc[(sub, ses), 'drug_label']
     return df
 
 
 def extract_drug_info(search_dir, search_pattern):
     """looks for a drug field in collection"""
+
     df = pd.DataFrame(columns=['drug'], index=pd.MultiIndex(levels=[[], []], 
                                                             codes=[[], []]))
     glob_files = sorted(glob.glob(search_dir + os.sep + search_pattern))

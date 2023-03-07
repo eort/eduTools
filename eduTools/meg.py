@@ -12,6 +12,8 @@ from mne import (Annotations, read_evokeds, write_evokeds,
                  read_vectorview_selection, pick_types)
 from mne.viz import (plot_events, plot_projs_topomap)
 from mne.preprocessing import (ICA, find_bad_channels_maxwell,
+                               maxwell_filter,
+                               oversampled_temporal_projection,  
                                create_eog_epochs, create_ecg_epochs)
 from mne.time_frequency import tfr_morlet
 import mne_bids as mb
@@ -25,49 +27,45 @@ from seaborn import heatmap
 
 from . import plot as pt
 
-
-def add_metadata(ep, beh_path, meta_info):
-    event_df = read_csv(beh_path, sep='\t', usecols=meta_info['usecols'])
-    if meta_info['n_trials'] == ep.events.shape[0]:
-        ep.metadata = event_df
-    else:
-        raise NotImplementedError("Non-standard subject! Fixing necessary!")
-        fix_trialcount_epoch(ep)
-    return ep
-
-def fix_trialcount_epoch(ep):
-    return ep
-
-def annotate_breaks(events, first_time, info, pre_time=1.5, post_time=3.5,
-                    block_trg=1, trial_trg=4):
+def annotate_breaks(raw, events, ep_info):
     """Finds the breaks in the experiment and annotates them as bad """
+
+    # read out epoch related info:
+    stim_min = ep_info['stim_min']
+    stim_max = ep_info['stim_max']
+    trial_trg = ep_info['trial_trg']
+    block_trg = ep_info['block_trg']
+    bad_buffer = ep_info['bad_buffer']
+    pre_time = np.abs(stim_min) + bad_buffer
+    post_time = np.abs(stim_max) + bad_buffer
 
     # find all the start block triggers (breaks happen right before)
     start_block = np.where(events[:, 2] == block_trg)[0]
 
     # when did the pause end?
-    end_times = events[start_block, 0] / info['sfreq'] - pre_time
+    end_times = events[start_block, 0] / raw.info['sfreq'] - pre_time
 
     # move back in the event history to find the end of the previous trial
     start_time = []
     for idx in start_block:
-        while (events[idx, 2] != trial_trg):
+        while (events[idx, 2] not in trial_trg):
             idx -= 1
             # if we are at start of exp, everything before trigger can go
-            if idx == 0:
+            if idx <= 0:
                 break
         # add the times of when the pause starts
-        if idx == 0 and end_times[0] - first_time > 0:
-            start_time.append(first_time)
+        if idx <= 0 and end_times[0] - raw.first_time > 0:
+            start_time.append(raw.first_time)
         else:
             # in other blocks, start 3 seconds after last stimulus onset
-            start_time.append(events[idx, 0] / info['sfreq'] + post_time)
+            start_time.append(events[idx, 0] / raw.info['sfreq'] + post_time)
 
     # duration of the break
     duration = end_times - start_time
 
     # create Annotations
-    return Annotations(start_time, duration, 'BAD_break', info['meas_date'])
+    return Annotations(start_time, duration, 'BAD_break',
+                       raw.info['meas_date'])
 
 
 def check_epochs(epochs):
@@ -629,16 +627,8 @@ def read_events(raw, bids_path):
     # load events
     events, event_dict = events_from_annotations(raw, event_dict)
 
-    # in case it is known that something is wrong with a specific sub/ses
-    # fix it (based on manual inspection)
-    if sub == '19' and ses == '02':
-        new_events = np.zeros((events.shape[0] - 2, events.shape[1]))
-        new_events[:1370, :] = events[:1370, :]
-        new_events[1370:, :] = events[1372:, :]
-        events = new_events
-    elif sub == '21' and ses == '03':
-        events[1864, 2] = 4
-    elif 'undefined_1' in event_dict.keys():
+    # are there forgotten problems?
+    if 'undefined_1' in event_dict.keys():
         logging.warning("There are undefined events. Make sure that is okay")
     
     return events, event_dict
@@ -679,6 +669,47 @@ def load_misses(epochs):
 
     # otherwise return the indices of the missed responses
     return list(df.loc[pd.isnull(df.resp_key), :].index)
+
+
+def maxwell_filter_wrapper(raw, calibration, cross_talk, duration, correlation,
+                   outpath=None):
+
+    # pre filter power spectrum
+    fig, ax = plt.subplots(2, 2, figsize=(15, 7.5), sharex=True, sharey=True)
+    psd = raw.compute_psd()
+    psd.plot(xscale='log', average=False, show=False, axes=ax[:2, 0])
+
+    # run maxwell filtering algorithm
+    raw = maxwell_filter(raw, verbose=True, calibration=calibration,
+                            cross_talk=cross_talk, st_duration=duration,
+                            st_correlation=correlation)
+    
+    # post filter power spectrum
+    psd = raw.compute_psd()
+    psd.plot(xscale='log', average=False, show=False, axes=ax[:2, 1])
+
+    fig.suptitle('Unprocessed (left) and processed (right) raw power spectra')
+    pt.save_plot(fig, outpath, dpi=600)
+    return raw
+
+
+def oversampled_temporal_projection_wrapper(raw, outpath=None):
+
+    # pre filter power spectrum
+    fig, ax = plt.subplots(2, 2, figsize=(15, 7.5), sharex=True, sharey=True)
+    psd = raw.compute_psd()
+    psd.plot(xscale='log', average=False, show=False, axes=ax[:2, 0])
+
+    # run oversampled_temporal_projection
+    raw = oversampled_temporal_projection(raw)
+    
+    # post filter power spectrum
+    psd = raw.compute_psd()
+    psd.plot(xscale='log', average=False, show=False, axes=ax[:2, 1])
+
+    fig.suptitle('Unprocessed (left) and processed (right) raw power spectra')
+    pt.save_plot(fig, outpath, dpi=600)
+    return raw
 
 
 def plot_diagnostic_ERF(dirty_ep, clean_ep, filter, baseline=(-0.2, 0),
