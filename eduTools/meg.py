@@ -8,8 +8,9 @@ from autoreject import read_auto_reject
 import numpy as np
 from mne import (Annotations, read_evokeds, write_evokeds,
                  compute_proj_raw, annotations_from_events,
-                 events_from_annotations,
-                 read_vectorview_selection, pick_types)
+                 events_from_annotations, Epochs,
+                 read_vectorview_selection, pick_types,
+                 concatenate_epochs)
 from mne.viz import (plot_events, plot_projs_topomap)
 from mne.preprocessing import (ICA, find_bad_channels_maxwell,
                                maxwell_filter,
@@ -66,6 +67,19 @@ def annotate_breaks(raw, events, ep_info):
     # create Annotations
     return Annotations(start_time, duration, 'BAD_break',
                        raw.info['meas_date'])
+
+
+def shift_onset_annotations(raw_annots, event, time_shift):
+    # extract info
+    onset = raw_annots.onset
+    duration = raw_annots.duration
+    description = raw_annots.description
+    orig_time = raw_annots.orig_time
+    # update onset of events
+    bad_event_idx = np.where(raw_annots.description == event)[0]
+    bad_event_idx = bad_event_idx[1:]
+    onset[bad_event_idx] = onset[bad_event_idx] + time_shift
+    return Annotations(onset, duration, description, orig_time)
 
 
 def check_epochs(epochs):
@@ -275,12 +289,7 @@ def compute_ICA(epochs, AR_settings, l_freq=1, n_components=50,
         logging.info("Exclude noise in data prior to ICA")
         megs = pick_types(epochs.info, meg=True, eeg=False)
         rej, _ = run_autorej(epochs, megs, n_jobs, random_state)
-        rej.save(AR_settings['ar_path'], overwrite=True)
-        epochs = rej.transform(epochs)        
-    elif AR_settings['apply_ar'] == 'load':
-        logging.info("Load autoreject solution.")
-        # load data
-        rej = read_auto_reject(AR_settings['ar_path'])
+        # rej.save(AR_settings['ar_path'], overwrite=True)
         epochs = rej.transform(epochs)
     else:
         logging.info("Step skipped: No noisy epochs marked")
@@ -332,12 +341,11 @@ def detect_blinks(raw, ch_name='EOG127', tmin=-0.2, tmax=0.2, event_id=1000,
         What event of the original raw is used to check for blink presence
     """
     # find EOG events and extract annotations
-    eog_ep = create_eog_epochs(raw, ch_name=ch_name,
-                                                 tmin = -tmin, tmax=tmax,
-                                                 event_id=event_id)
+    eog_ep = create_eog_epochs(raw, ch_name=ch_name, tmin = -tmin, tmax=tmax,
+                               event_id=event_id)
     eog_an = annotations_from_events(eog_ep.events, raw.info['sfreq'],
-                                         event_desc={event_id:"BAD_blink"},
-                                         orig_time=raw.annotations.orig_time)
+                                     event_desc={event_id:"BAD_blink"},
+                                     orig_time=raw.annotations.orig_time)
 
     # adjust annotations to contain only the blink
     eog_an.onset = eog_an.onset + tmin
@@ -360,6 +368,10 @@ def detect_blinks(raw, ch_name='EOG127', tmin=-0.2, tmax=0.2, event_id=1000,
     # at the end of the preprocessing, the final epochs can be checked whether
     # the blink epochs match up
     return bad_epochs
+
+
+def extract_baseline_activity(ep, tmin, tmax):
+    return ep.load_data().get_data(tmin=tmin, tmax=tmax).mean(axis=-1)
 
 
 def filtering(raw, l_freq=None, h_freq=None, freqs=None, picks=None, fmin=0.1,
@@ -483,6 +495,14 @@ def fixEvents(events, target_set, rule='liberal'):
         raise ValueError(f'{rule} is not a valid keyword for rule.')
 
 
+def fix_bem_surfaces(subjects_dir, subject):
+    import pymeshfix
+    rr, tris = mne.surface.read_surface(f'{subjects_dir}/sub-{sub:02d}/surf/lh.seghead')
+    rr, tris = pymeshfix.clean_from_arrays(rr, tris)
+    mne.surface.write_surface(op.join(subjects_dir,subject, 'surf', 
+                                      'lh.seghead'), rr, tris, overwrite=True)
+
+
 def get_tSSS_duration(raw, low=10, high=19, step=0.5):
     """Based on duration of recording, compute optimal value for st_duration
     
@@ -561,7 +581,8 @@ def interpolate_autoreject(epochs, ar_obj):
     return epochs
 
 
-def filter_events(events, event_dict, label, mode=None, extra_label=None):
+def filter_events(events, event_dict, label, pre_trg=None, post_trg=None,
+                  pre_nontrg=None, post_nontrg=None):
     """From all events select a subset based on label
 
     To simplify code, label needs to be an interable!
@@ -571,39 +592,55 @@ def filter_events(events, event_dict, label, mode=None, extra_label=None):
     trigger values). Perhaps we fix it at another time. 
 
     """
-
     if not isinstance(label, (list, tuple, np.ndarray)):
         raise ValueError('label must be a list or array or other sequence!')
 
     trigger = []
     for trg in label: 
         trigger.append(event_dict[trg])
+    ep_id = {k:v for (k, v) in event_dict.items() if v in trigger}
 
-    if mode is None:
-        stim = events[np.where(np.isin(events[:, 2], trigger))[0]]
-        sid = {k:v for (k, v) in event_dict.items() if v in trigger}
+    keep_idx = np.where(np.isin(events[:, 2], trigger))[0]
+    
+    if pre_trg is not None :
+        priors = keep_idx - 1
+        priors = priors[np.isin(events[priors, 2], pre_trg),]
+        keep_idx = priors + 1
 
-    # if an event depends on another depend happening earlier
-    elif mode == 'pre':
-        targets = np.where(np.isin(events[:, 2], trigger))[0]
-        priors = targets - 1
-        stimulus = np.isin(events[priors,2], extra_label)
-        priors = priors[stimulus,]
-        stim = events[priors + 1,]
-        sid = {k:v for (k, v) in event_dict.items() if v in trigger}
+    if post_trg is not None :
+        posts = keep_idx + 1
+        posts = posts[np.isin(events[posts, 2], post_trg),]
+        keep_idx = posts - 1
 
-    # if an event depends on another depend happening later
-    elif mode == 'post':
-        targets = np.where(np.isin(events[:, 2], trigger))[0]
-        posts = targets + 1
-        # make sure the posts index won't exceed array
-        posts = posts[:events.shape[0]]
-        stimulus = np.isin(events[posts,2], extra_label)
-        posts = posts[stimulus,]
-        stim = events[posts - 1,]
-        sid = {k:v for (k, v) in event_dict.items() if v in trigger}
+    keep_events = events[keep_idx]
+    return keep_events.astype(int), ep_id
 
-    return stim.astype(int), sid
+
+def generate_resplocked_epochs(ep, events, tmin=-1, tmax=0.8):
+    """Function to generate response locked epochs through time
+
+    shifts from stim-locked epochs. Hardcoding here is not ideal """
+    new_epochs = []
+    resp_ep = ep['resp_time > 0.2'].load_data()
+    for epI in range(resp_ep.events.shape[0]):
+        ep = resp_ep[epI]
+        ev = ep.events[:, 0]
+        idx = np.where(events[:, 0] == ev)[0]
+        if events[idx + 1, 2] not in [512, 2048]:
+            logging.warning("Problem with response epochs making!")
+        resp_time = events[idx + 1, 0]
+        t_shift = 0.001 * (resp_time - ev)
+        new_epochs.append(ep.shift_time(-t_shift).crop(tmin=tmin, tmax=tmax))
+    return concatenate_epochs(new_epochs)
+
+
+def make_notch_filtered_epochs(raw, events, event_id, tmin, tmax, picks,
+                               baseline, freq=10, notch_widths=2.5):
+    raw_notch = raw.copy().load_data().notch_filter(freq,
+                                                    notch_widths=notch_widths)
+    return Epochs(raw_notch, events=events, event_id=event_id, tmin=tmin,
+                  tmax=tmax, picks=picks, baseline=baseline)
+
 
 def read_events(raw, bids_path):
     """Reads events in a robust-ish way. 
@@ -831,10 +868,8 @@ def run_autorej(epochs, picks, n_jobs=1, seed=10, outpath=None):
     """Use autoreject (local) to find bad and maybe fix epochs"""
 
     # set parameters for autoreject
-    #n_interpolates = np.array((1, 3, 6, 9))
-    #consensus_percs = np.linspace(0, 1, 9)
     n_interpolates = np.array((1, 2, 3, 5, 7, 9))
-    consensus_percs = np.linspace(0, 0.9, 10)
+    consensus_percs = np.linspace(0.2, 0.7, 11)
 
 
     # init autoreject object
@@ -854,6 +889,14 @@ def run_autorej(epochs, picks, n_jobs=1, seed=10, outpath=None):
 
     # return it 
     return rej, rej_log
+
+
+def set_bad_channels(channel_infile):
+    try:
+        channels_df = pd.read_csv(channel_infile, sep='\t')
+    except FileNotFoundError as e:
+        logging.error(f'{channel_infile} does not exist.')
+    return channels_df.loc[channels_df.status == 'bad', 'name'].tolist()
 
 
 def viz_autorej(reject_log, outpath):
