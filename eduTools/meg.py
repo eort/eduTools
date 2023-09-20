@@ -17,6 +17,7 @@ from mne.preprocessing import (ICA, find_bad_channels_maxwell,
                                oversampled_temporal_projection,  
                                create_eog_epochs, create_ecg_epochs)
 from mne.time_frequency import tfr_morlet
+from mne.surface import write_surface
 import mne_bids as mb
 import pandas as pd
 from pandas import read_csv
@@ -499,8 +500,8 @@ def fix_bem_surfaces(subjects_dir, subject):
     import pymeshfix
     rr, tris = mne.surface.read_surface(f'{subjects_dir}/sub-{sub:02d}/surf/lh.seghead')
     rr, tris = pymeshfix.clean_from_arrays(rr, tris)
-    mne.surface.write_surface(op.join(subjects_dir,subject, 'surf', 
-                                      'lh.seghead'), rr, tris, overwrite=True)
+    write_surface(op.join(subjects_dir,subject, 'surf', 'lh.seghead'),
+                  rr, tris, overwrite=True)
 
 
 def get_tSSS_duration(raw, low=10, high=19, step=0.5):
