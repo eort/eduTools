@@ -184,8 +184,15 @@ def classify_components(ica, raw, epochs, mode, deriv_stub=None,
                                             threshold=0.5,
                                             measure='correlation')
     elif mode == 'ecg':
-        indices, scores = ica.find_bads_ecg(raw, threshold=0.5,
-                                            measure='correlation')
+        try:
+            indices, scores = ica.find_bads_ecg(raw, threshold=0.5,
+                                                measure='correlation')
+        except TypeError as e:
+            logging.info(("Due to bad ECG channel, no ECG events found."
+                           "Remove ECG channel and try to estimate ECG") )
+            raw.drop_channels('ECG063')
+            indices, scores = ica.find_bads_ecg(raw, threshold=0.5,
+                                                measure='correlation')
 
     ica.exclude = indices
 
@@ -202,19 +209,21 @@ def classify_components(ica, raw, epochs, mode, deriv_stub=None,
     return indices
 
 
-def plot_artifact(ica, raw, mode, indices, deriv_stub, qc_stub):
+def plot_artifact(ica, raw, mode, indices, load_art, deriv_stub, qc_stub):
     # try to read the artifact evoked objects from file
 
-    try: 
-        art_ev = read_evokeds(deriv_stub % f'{mode}_artifact-ave.fif')[0]
-    except FileNotFoundError as e:
+    if load_art: 
+         art_ev = read_evokeds(deriv_stub % f'{mode}_artifact-ave.fif')[0]
+    else:
         if mode == 'veog':
             art_ev = create_eog_epochs(raw, ch_name='EOG127').average()
         elif mode == 'heog':
             art_ev = create_eog_epochs(raw, ch_name='EOG128').average()
         elif mode == 'ecg':
             art_ev = create_ecg_epochs(raw).average()
-        write_evokeds(deriv_stub % f'{mode}_artifact-ave.fif', art_ev)
+        
+    write_evokeds(deriv_stub % f'{mode}_artifact-ave.fif', art_ev,
+                  overwrite=True)
 
     art_ev.apply_baseline(baseline=(-0.2, 0))
 
@@ -227,7 +236,7 @@ def plot_artifact(ica, raw, mode, indices, deriv_stub, qc_stub):
         # plot the actual artifact
         art_ev.apply_proj()
         for ch_type in ['grad', 'mag']:
-            fig = art_ev.plot_joint(picks=ch_type, show = False)
+            fig = art_ev.plot_joint(picks=ch_type, show=False)
             pt.save_plot(fig, dpi=300, 
                         outpath=qc_stub % f'ica_{mode}_artifact_{ch_type}.png')
         # plot sources pre and post
@@ -498,9 +507,11 @@ def fixEvents(events, target_set, rule='liberal'):
 
 def fix_bem_surfaces(subjects_dir, subject):
     import pymeshfix
-    rr, tris = mne.surface.read_surface(f'{subjects_dir}/sub-{sub:02d}/surf/lh.seghead')
+    from mne.surface import read_surface 
+    rr, tris = read_surface(op.join(subjects_dir, subject, 'surf',
+                            'lh.seghead'))
     rr, tris = pymeshfix.clean_from_arrays(rr, tris)
-    write_surface(op.join(subjects_dir,subject, 'surf', 'lh.seghead'),
+    write_surface(op.join(subjects_dir, subject, 'surf', 'lh.seghead'),
                   rr, tris, overwrite=True)
 
 
@@ -617,21 +628,27 @@ def filter_events(events, event_dict, label, pre_trg=None, post_trg=None,
     return keep_events.astype(int), ep_id
 
 
-def generate_resplocked_epochs(ep, events, tmin=-1, tmax=0.8):
+def generate_resplocked_epochs(ep, events, tmin=-1, tmax=0.8, timeout_trg=16):
     """Function to generate response locked epochs through time
-
+    
     shifts from stim-locked epochs. Hardcoding here is not ideal """
     new_epochs = []
-    resp_ep = ep['resp_time > 0.2'].load_data()
+    resp_ep = ep['resp_time > 0.205'].load_data()
     for epI in range(resp_ep.events.shape[0]):
-        ep = resp_ep[epI]
-        ev = ep.events[:, 0]
+        epoch = resp_ep[epI]
+        ev = epoch.events[:, 0]
         idx = np.where(events[:, 0] == ev)[0]
-        if events[idx + 1, 2] not in [512, 2048]:
-            logging.warning("Problem with response epochs making!")
+        if events[idx + 1, 2] == timeout_trg:
+            logging.info("Dropping a timeout trial, bc there is no response")
+            continue
+        elif events[idx + 1, 2] not in [512, 2048]:
+            logging.error("Problem with response epochs making!")
+            raise ValueError(f"Problem with response epochs making! For {epI}")
         resp_time = events[idx + 1, 0]
         t_shift = 0.001 * (resp_time - ev)
-        new_epochs.append(ep.shift_time(-t_shift).crop(tmin=tmin, tmax=tmax))
+        new_epochs.append(epoch.shift_time(-t_shift).crop(tmin=tmin, tmax=tmax))
+    logging.info((f"There are {len(new_epochs)} resp-locked epochs," 
+                  f" based on {ep.events.shape[0]} stim-locked epochs"))
     return concatenate_epochs(new_epochs)
 
 
@@ -654,7 +671,6 @@ def read_events(raw, bids_path):
     # load event tsv
     sub = bids_path.subject
     ses = bids_path.session
-    
     event_df = read_csv(bids_path.fpath, sep='\t')
 
     # extract unique events
@@ -662,13 +678,32 @@ def read_events(raw, bids_path):
     unique_ids = event_df.trial_type.unique()
     event_dict = {k:v for (k,v) in zip(unique_ids,unique_events)}
 
-    # load events
+    # use event tsv sidecar to extract up to date events
+    onsets = np.array(
+        [np.nan if on == "n/a" else on for on in event_df["onset"]], dtype=float
+    ) 
+    # we need to add the first sample time, to align the other annotations below
+    # with the events
+    onsets += raw.first_time
+    durations = np.array(
+        [0 if du == "n/a" else du for du in event_df["duration"]], dtype=float
+    )
+    descriptions = np.asarray(event_df["trial_type"], dtype=str)
+    annot_from_events = Annotations(onset=onsets, duration=durations,
+                                    description=descriptions,
+                                    orig_time=raw.annotations.orig_time)
+
+    # now we need to add the annotated breaks to these annotations, 
+    # otherwise they miss. So we extract them from the raw file
+    annot_idx_to_keep = [
+        idx for idx, descr in enumerate(raw.annotations.description)
+        if descr == "BAD_break"
+    ]
+    annot_to_keep = raw.annotations[annot_idx_to_keep]
+    raw.set_annotations(annot_from_events + annot_to_keep)
+
     events, event_dict = events_from_annotations(raw, event_dict)
 
-    # are there forgotten problems?
-    if 'undefined_1' in event_dict.keys():
-        logging.warning("There are undefined events. Make sure that is okay")
-    
     return events, event_dict
 
 
@@ -954,15 +989,15 @@ def zapline(raw, line_freq=50, sample_freq=1000, nremove=10, outpath=None):
     # do every channel type one by one to save memory
     data = raw.get_data(picks=mag_picks)
     raw._data[mag_picks] = dss_line(data.T, fline=line_freq, sfreq=sample_freq,
-                                nremove=10)[0].T
+                                nremove=nremove)[0].T
     data = raw.get_data(picks=planar1_picks)
     raw._data[planar1_picks] = dss_line(data.T, fline=line_freq, 
                                         sfreq=sample_freq,
-                                        nremove=10)[0].T    
+                                        nremove=nremove)[0].T    
     data = raw.get_data(picks=planar2_picks)
     raw._data[planar2_picks] = dss_line(data.T, fline=line_freq, 
                                         sfreq=sample_freq,
-                                        nremove=10)[0].T
+                                        nremove=nremove)[0].T
     # post filter power spectrum
     psd = raw.compute_psd()
     psd.plot(xscale='log', average=False, show=False, axes=ax[:2, 1])
